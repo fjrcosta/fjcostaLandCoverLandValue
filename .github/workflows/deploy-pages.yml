@@ -29,7 +29,10 @@ jobs:
       - name: Validate static assets and data
         run: |
           python scripts/validate_site.py
-          node --check site/map3d/assets/app.js
+          for module in app reachability; do
+            cp "site/map3d/assets/$module.js" "$RUNNER_TEMP/$module.mjs"
+            node --check "$RUNNER_TEMP/$module.mjs"
+          done
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5

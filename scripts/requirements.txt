@@ -2,3 +2,9 @@ numpy>=2.0
 pandas>=2.2
 pyproj>=3.7
 scipy>=1.15
+# build_reachability_data.py
+geopandas>=1.0
+networkx>=3.4
+osmnx>=2.0
+# smoke_test.py
+playwright>=1.50

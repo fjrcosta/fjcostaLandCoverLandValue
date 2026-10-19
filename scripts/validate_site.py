@@ -24,7 +24,11 @@ def main() -> None:
     manifest_path = MAP3D / "data" / "manifest.json"
     transport_manifest_path = MAP3D / "data" / "transport" / "manifest.json"
     economics_path = MAP3D / "data" / "economics" / "municipalities.geojson"
-    for path in (landing, index, app, css, manifest_path, transport_manifest_path, economics_path):
+    reach_js = MAP3D / "assets" / "reachability.js"
+    reach_params_path = MAP3D / "data" / "reachability" / "params.json"
+    reach_data_path = MAP3D / "data" / "reachability" / "londrina.json"
+    for path in (landing, index, app, css, manifest_path, transport_manifest_path, economics_path,
+                 reach_js, reach_params_path, reach_data_path):
         if not path.exists():
             fail(f"Missing {path.relative_to(ROOT)}")
 
@@ -36,7 +40,8 @@ def main() -> None:
         "map", "citySelect", "coverDimension", "valueDimension", "transportDimension",
         "heightScale", "valueTint", "coverTint", "transportTint", "classFilters",
         "roadFilters", "toggleRoadClasses", "ludDimension", "lvyDimension",
-        "economicsInsightContent", "loadingOverlay", "aboutDialog"
+        "economicsInsightContent", "loadingOverlay", "aboutDialog",
+        "reachDimension", "reachMode", "reachSummary", "reachStatus"
     ]
     for element_id in required_ids:
         if not re.search(rf'id=["\']{re.escape(element_id)}["\']', html):
@@ -194,10 +199,51 @@ def main() -> None:
         if not points or not all(-180 <= point[0] <= 180 and -90 <= point[1] <= 90 for point in points):
             fail(f"Economics geometry is not EPSG:4326 for {properties.get('slug', 'unknown')}")
 
+    reach = json.loads(reach_data_path.read_text(encoding="utf-8"))
+    if reach.get("schemaVersion") != 1:
+        fail("Reachability data does not use schema version 1")
+    reach_meta = next((item for item in cities if item.get("slug") == reach.get("city")), None)
+    if reach_meta is None:
+        fail(f"Reachability city {reach.get('city')} is not in the analytical manifest")
+    reach_cells = len(json.loads((MAP3D / reach_meta["file"]).read_text(encoding="utf-8"))["cells"])
+    for network in ("walk", "drive"):
+        graph = reach[network]
+        n, m = len(graph["lon"]), len(graph["targets"])
+        if len(graph["lat"]) != n or len(graph["offsets"]) != n + 1 or graph["offsets"][-1] != m or len(graph["lengths"]) != m:
+            fail(f"Inconsistent CSR arrays in the reachability {network} network")
+        if any(not 0 <= target < n for target in graph["targets"]) or any(length < 0 for length in graph["lengths"]):
+            fail(f"Invalid edge in the reachability {network} network")
+    walk_n, drive_n = len(reach["walk"]["lon"]), len(reach["drive"]["lon"])
+    cell_links = reach["cells"]
+    if any(len(cell_links[key]) != reach_cells for key in ("walkNode", "walkSnapM", "driveNode", "driveSnapM")):
+        fail("Reachability cell links and analytical cells are out of sync")
+    if any(not 0 <= node < walk_n for node in cell_links["walkNode"]) or any(not 0 <= node < drive_n for node in cell_links["driveNode"]):
+        fail("Reachability cell links reference missing network nodes")
+    stops = reach["stops"]
+    n_stops = len(stops["name"])
+    if any(len(stops[key]) != n_stops for key in ("lon", "lat", "walkNode", "walkSnapM", "hub")):
+        fail("Inconsistent reachability stop arrays")
+    for i, pattern in enumerate(reach["patterns"]):
+        sequence, cumulative = pattern["stops"], pattern["cum"]
+        if len(sequence) < 2 or len(sequence) != len(cumulative) or any(not 0 <= s < n_stops for s in sequence):
+            fail(f"Invalid bus stop pattern {i}")
+        if any(b < a for a, b in zip(cumulative, cumulative[1:])):
+            fail(f"Bus stop pattern {i} has decreasing on-route distance")
+    params = json.loads(reach_params_path.read_text(encoding="utf-8"))
+    required_params = {
+        "walk": {"speedKmh"},
+        "car": {"speedKmh", "walkToCarMin", "parkAndWalkMin"},
+        "bus": {"speedKmh", "walkSpeedKmh", "maxAccessWalkMin", "waitMin", "terminalTransferWaitMin", "maxEgressWalkMin"},
+    }
+    if "budgetMin" not in params or any(not keys.issubset(params.get(mode, {})) for mode, keys in required_params.items()):
+        fail("Reachability params.json is incomplete")
+
     print(
         f"Validated static site: {len(cities)} cities, {len(classes)} classes, "
         f"{total:,} cells, {total_roads:,} unique OSM road geometries, "
-        f"{len(features)} municipal economics polygons, datasetMode={manifest.get('datasetMode')}"
+        f"{len(features)} municipal economics polygons, "
+        f"reachability {reach['city']} ({walk_n:,} walk / {drive_n:,} drive nodes, {n_stops:,} stops, "
+        f"{len(reach['patterns'])} bus patterns), datasetMode={manifest.get('datasetMode')}"
     )
 
 

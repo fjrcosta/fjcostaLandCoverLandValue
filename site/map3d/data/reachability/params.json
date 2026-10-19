@@ -1,0 +1,14 @@
+{
+  "reference": "Bertaud, A. (2018). Order without Design: How Markets Shape Cities. MIT Press — one-hour commute budget.",
+  "budgetMin": 60,
+  "walk": { "speedKmh": 5.0 },
+  "car": { "speedKmh": 35.0, "walkToCarMin": 2, "parkAndWalkMin": 2 },
+  "bus": {
+    "speedKmh": 20.0,
+    "walkSpeedKmh": 5.0,
+    "maxAccessWalkMin": 10,
+    "waitMin": 10,
+    "terminalTransferWaitMin": 10,
+    "maxEgressWalkMin": 10
+  }
+}

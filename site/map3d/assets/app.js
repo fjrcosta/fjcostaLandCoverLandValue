@@ -1,3 +1,13 @@
+import { prepareNetwork, reachWalk, reachCar, reachBus } from './reachability.js?v=20261019-1';
+
+const REACH_CITY = 'londrina';
+const REACH_COLORS = ['#fde725', '#7ad151', '#22a884', '#2a788e', '#414487', '#440154'];
+const REACH_MODES = {
+  walk: { label: 'Walking', fn: reachWalk },
+  car: { label: 'Car', fn: reachCar },
+  bus: { label: 'Bus', fn: reachBus }
+};
+
 const CLASS_COLORS = {
   bare: '#bf8040',
   bush: '#009900',
@@ -73,7 +83,16 @@ const state = {
   map: null,
   coordinateMarker: null,
   buildingLayerId: null,
-  hoverObject: null
+  hoverObject: null,
+  reachActive: false,
+  reachMode: 'walk',
+  reachNet: null,
+  reachParams: null,
+  reachCells: null,
+  reachCellIndex: null,
+  reachOrigin: null,
+  reachTimes: null,
+  reachMarker: null
 };
 
 const dom = {};
@@ -94,7 +113,8 @@ function bindDom() {
     'classStatisticsBody', 'classStatisticsTotal', 'legendMin', 'legendMedian', 'legendMax',
     'valueLegendSection', 'economicsLegendSection', 'economicsLegendTitle', 'economicsLegendMin', 'economicsLegendMax',
     'hoverCard', 'loadingOverlay', 'errorBanner',
-    'aboutDialog', 'dataWarning', 'tintSection', 'heightSection'
+    'aboutDialog', 'dataWarning', 'tintSection', 'heightSection',
+    'reachDimension', 'reachControls', 'reachMode', 'reachSummary', 'reachStatus'
   ];
   ids.forEach(id => { dom[id] = document.getElementById(id); });
 }
@@ -224,7 +244,9 @@ function colorForCell(cell) {
   const valueWeight = state.activeDimensions.has('value') ? state.valueTint : 0;
   const totalWeight = coverWeight + valueWeight;
   if (totalWeight === 0) return [0, 0, 0, 0];
-  const alpha = Math.round(232 * Math.min(1, totalWeight));
+  const reachTime = cellReachTime(cell);
+  const reachDim = reachTime === null || reachTime <= state.reachParams.budgetMin * 60 ? 1 : 0.18;
+  const alpha = Math.round(232 * Math.min(1, totalWeight) * reachDim);
   if (coverWeight === 0) return [...valueRgb.slice(0, 3), alpha];
   if (valueWeight === 0) return [...classRgb.slice(0, 3), alpha];
   return mixColor(classRgb, valueRgb, valueWeight / totalWeight, alpha);
@@ -476,7 +498,7 @@ function updateScene() {
     },
     updateTriggers: {
       getElevation: [state.activeDimensions.has('value'), state.heightScale, state.manifest.globalStats.min, state.manifest.globalStats.max],
-      getFillColor: [state.activeDimensions.has('cover'), state.activeDimensions.has('value'), state.coverTint, state.valueTint, ...state.selectedClasses]
+      getFillColor: [state.activeDimensions.has('cover'), state.activeDimensions.has('value'), state.coverTint, state.valueTint, ...state.selectedClasses, state.reachMode, state.reachOrigin?.join(',')]
     },
     onHover: handleHover,
     onClick: info => {
@@ -533,7 +555,7 @@ function updateScene() {
   }) : null;
 
   state.overlay.setProps({
-    layers: [gridLayer, roadLayer, centerLayer].filter(Boolean),
+    layers: [reachabilityLayer(), gridLayer, roadLayer, centerLayer].filter(Boolean),
     effects: [lightingEffect],
     parameters: { depthTest: true }
   });
@@ -629,6 +651,7 @@ function analyticalCellDetailsHtml(cell) {
     <div class="hover-row"><span>50th percentile:</span><strong>${formatCurrency(cell[2])}</strong></div>
     <div class="hover-row"><span>90th percentile:</span><strong>${formatCurrency(q90)}</strong></div>
     <div class="hover-row"><span>Land value prediction normalised interval:</span><strong>${pointwiseWidth.toFixed(4)}</strong></div>
+    ${reachHoverHtml(cell)}
   `;
 }
 
@@ -957,7 +980,8 @@ function updateCompactLegend() {
     classes: [...state.selectedClasses].sort(),
     roads: [...state.selectedRoadClasses].sort(),
     economics: state.economicsMetric,
-    valueHeight: state.heightScale > 0
+    valueHeight: state.heightScale > 0,
+    reach: state.reachActive && state.reachTimes ? state.reachMode : null
   });
 
   if (signature !== state.compactLegendSignature) {
@@ -1021,6 +1045,15 @@ function updateCompactLegend() {
           <h3 class="compact-legend-heading">${config.label} · ${config.unit}</h3>
           <div class="compact-value-gradient"></div>
           <div class="compact-value-labels"><span>${formatEconomics(min, config.decimals)}</span><span>${formatEconomics(max, config.decimals)}</span></div>
+        </section>`);
+    }
+
+    if (state.reachActive && state.reachTimes) {
+      sections.push(`
+        <section class="compact-legend-section">
+          <h3 class="compact-legend-heading">${REACH_MODES[state.reachMode].label} travel time (min)</h3>
+          <div class="reach-gradient"></div>
+          <div class="compact-value-labels"><span>0</span><span>30</span><span>${state.reachParams.budgetMin}</span></div>
         </section>`);
     }
 
@@ -1190,6 +1223,17 @@ function wireEvents() {
     else startTour();
   });
 
+  dom.reachDimension.addEventListener('change', () => {
+    if (dom.reachDimension.checked) activateReach();
+    else deactivateReach();
+  });
+
+  dom.reachMode.addEventListener('change', () => {
+    state.reachMode = dom.reachMode.value;
+    updateReachSummary();
+    updateScene();
+  });
+
   dom.basemapSelect.addEventListener('change', () => {
     setBasemap(dom.basemapSelect.value);
   });
@@ -1209,7 +1253,146 @@ function wireEvents() {
   });
 }
 
+function cellReachTime(cell) {
+  if (!state.reachActive || !state.reachTimes) return null;
+  const index = state.reachCellIndex.get(cell);
+  if (index === undefined) return null;
+  return state.reachTimes[state.reachMode][index];
+}
+
+function reachColor(seconds, alpha) {
+  const t = Math.max(0, Math.min(1, seconds / (state.reachParams.budgetMin * 60)));
+  const scaled = t * (REACH_COLORS.length - 1);
+  const index = Math.min(REACH_COLORS.length - 2, Math.floor(scaled));
+  return mixColor(hexToRgb(REACH_COLORS[index]), hexToRgb(REACH_COLORS[index + 1]), scaled - index, alpha);
+}
+
+function reachabilityLayer() {
+  if (!state.reachActive || !state.reachTimes) return null;
+  const budget = state.reachParams.budgetMin * 60;
+  const times = state.reachTimes[state.reachMode];
+  const cells = state.reachCells;
+  const data = [];
+  cells.forEach((cell, i) => { if (times[i] <= budget) data.push({ polygon: cell[9], time: times[i] }); });
+  return new deck.SolidPolygonLayer({
+    id: `reachability-${state.reachMode}-${state.reachOrigin.join(',')}`,
+    data,
+    extruded: false,
+    pickable: false,
+    getPolygon: d => d.polygon,
+    getFillColor: d => reachColor(d.time, 190),
+    parameters: { depthTest: false }
+  });
+}
+
+function reachHoverHtml(cell) {
+  const time = cellReachTime(cell);
+  if (time === null) return '';
+  const label = REACH_MODES[state.reachMode].label;
+  const text = time <= state.reachParams.budgetMin * 60 ? `${(time / 60).toFixed(0)} min` : `> ${state.reachParams.budgetMin} min`;
+  return `
+    <div class="hover-divider"></div>
+    <div class="hover-section-title">Commute reachability</div>
+    <div class="hover-row"><span>${label} travel time from origin:</span><strong>${text}</strong></div>`;
+}
+
+async function loadReachability() {
+  if (state.reachNet) return;
+  const cityIndex = state.manifest.cities.findIndex(c => c.slug === REACH_CITY);
+  const [params, raw, city] = await Promise.all([
+    fetchJson('./data/reachability/params.json'),
+    fetchJson(`./data/reachability/${REACH_CITY}.json`),
+    loadCity(state.manifest.cities[cityIndex], cityIndex)
+  ]);
+  if (raw.cells.walkNode.length !== city.cells.length) throw new Error('Reachability data and Londrina cells are out of sync');
+  state.reachParams = params;
+  state.reachNet = prepareNetwork(raw);
+  state.reachCellIndex = new Map(city.cells.map((cell, i) => [cell, i]));
+  state.reachCells = city.cells;
+}
+
+async function activateReach() {
+  if (state.economicsMetric) {
+    deactivateEconomics();
+    updateDimensionControls();
+  }
+  state.reachActive = true;
+  dom.reachControls.hidden = false;
+  dom.reachStatus.textContent = 'Loading Londrina walk, drive and bus networks…';
+  if (state.selectedCity !== REACH_CITY) {
+    state.selectedCity = REACH_CITY;
+    dom.citySelect.value = REACH_CITY;
+    stopTour();
+    loadSelection();
+    flyToCity(REACH_CITY);
+  }
+  try {
+    await loadReachability();
+  } catch (error) {
+    console.error(error);
+    dom.reachStatus.textContent = `Reachability data could not be loaded: ${error.message}`;
+    return;
+  }
+  dom.reachStatus.textContent = state.reachOrigin
+    ? 'Click the map to move the origin.'
+    : 'Click a location in Londrina (e.g. a bare-soil or row-crop patch) to set the commuting origin.';
+  updateScene();
+}
+
+function deactivateReach() {
+  state.reachActive = false;
+  dom.reachDimension.checked = false;
+  dom.reachControls.hidden = true;
+  if (state.reachMarker) state.reachMarker.remove();
+  state.reachMarker = null;
+  updateScene();
+}
+
+function setReachOrigin(lon, lat) {
+  if (!state.reachNet) return;
+  const started = performance.now();
+  state.reachTimes = Object.fromEntries(
+    Object.entries(REACH_MODES).map(([mode, { fn }]) => [mode, fn(state.reachNet, state.reachParams, lon, lat)])
+  );
+  const elapsed = performance.now() - started;
+  state.reachOrigin = [lon, lat];
+  if (state.reachMarker) state.reachMarker.remove();
+  state.reachMarker = new maplibregl.Marker({ color: '#f97316' }).setLngLat([lon, lat]).addTo(state.map);
+  dom.reachStatus.textContent = `Origin ${lat.toFixed(5)}, ${lon.toFixed(5)} · three modes computed in ${elapsed.toFixed(0)} ms. Click to move the origin.`;
+  updateReachSummary();
+  updateScene();
+}
+
+function updateReachSummary() {
+  if (!state.reachTimes) {
+    dom.reachSummary.hidden = true;
+    return;
+  }
+  const budget = state.reachParams.budgetMin * 60;
+  const cells = state.reachCells;
+  const industrialTotal = cells.filter(cell => classKey(cell) === 'industrial').length;
+  const rows = Object.entries(REACH_MODES).map(([mode, { label }]) => {
+    const times = state.reachTimes[mode];
+    let reached = 0;
+    let industrial = 0;
+    cells.forEach((cell, i) => {
+      if (times[i] > budget) return;
+      reached += 1;
+      if (classKey(cell) === 'industrial') industrial += 1;
+    });
+    const share = industrialTotal ? industrial / industrialTotal * 100 : 0;
+    return `<tr class="${mode === state.reachMode ? 'is-active' : ''}">
+      <td>${label}</td><td>${formatAreaCompact(reached)}</td><td>${formatAreaCompact(industrial)}</td>
+      <td>${share.toLocaleString('pt-BR', { maximumFractionDigits: 0 })}%</td></tr>`;
+  }).join('');
+  dom.reachSummary.innerHTML = `
+    <thead><tr><th>≤ ${state.reachParams.budgetMin} min</th><th>Reached</th><th>Industrial</th><th>of city</th></tr></thead>
+    <tbody>${rows}</tbody>`;
+  dom.reachSummary.hidden = false;
+}
+
 function activateEconomics(metric) {
+  if (state.reachActive) deactivateReach();
   state.economicsMetric = metric;
   state.activeDimensions.clear();
   dom.coverDimension.checked = false;
@@ -1446,7 +1629,8 @@ function initMap() {
     state.map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
     state.map.on('click', event => {
       const { lat, lng } = event.lngLat;
-      locateCoordinates(lat, lng);
+      if (state.reachActive) setReachOrigin(lng, lat);
+      else locateCoordinates(lat, lng);
     });
 
     state.map.once('load', () => {
